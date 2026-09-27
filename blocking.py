@@ -21,6 +21,8 @@ Output: work/<split>/candidates.parquet
     query_id, s1_id, country, <channel>_sim, <channel>_rank, [is_match]
 """
 import argparse
+import multiprocessing as mp
+import os
 import time
 from pathlib import Path
 
@@ -69,7 +71,21 @@ def topk_rows(M, k):
             np.concatenate(vals), np.concatenate(ranks))
 
 
-def run_channel(cfg, s1_df, q_df, k, chunk_rows):
+_SHARED = {}
+
+
+def _search_chunk(start):
+    Q, XT, k, chunk = _SHARED["Q"], _SHARED["XT"], _SHARED["k"], _SHARED["chunk"]
+    M = (Q[start:start + chunk] @ XT).tocsr()
+    q, s, v, r = topk_rows(M, k)
+    return q + start, s, v, r
+
+
+def can_fork():
+    return "fork" in mp.get_all_start_methods()
+
+
+def run_channel(cfg, s1_df, q_df, k, chunk_rows, workers=1):
     """TF-IDF index on S1, then top-k S1 matches for each query record."""
     s1_text = cfg["text"](s1_df).fillna("").tolist()
     q_text = cfg["text"](q_df).fillna("").tolist()
@@ -83,19 +99,26 @@ def run_channel(cfg, s1_df, q_df, k, chunk_rows):
     Q = vec.transform(q_text)
 
     chunk = max(100, int(chunk_rows * cfg["chunk_scale"]))
-    parts = []
-    for start in range(0, Q.shape[0], chunk):
-        M = (Q[start:start + chunk] @ XT).tocsr()
-        q, s, v, r = topk_rows(M, k)
-        parts.append((q + start, s, v, r))
+    starts = list(range(0, Q.shape[0], chunk))
+    if not starts:
+        return None
+    _SHARED.update(Q=Q, XT=XT, k=k, chunk=chunk)
+    try:
+        if workers > 1 and can_fork():  # Linux/EC2: search chunks in parallel
+            with mp.get_context("fork").Pool(workers) as pool:
+                parts = pool.map(_search_chunk, starts, chunksize=1)
+        else:                           # Windows: one chunk at a time
+            parts = [_search_chunk(st) for st in starts]
+    finally:
+        _SHARED.clear()
     return tuple(np.concatenate(x) for x in zip(*parts))
 
 
-def block_country(s1c, qc, k, chunk_rows):
+def block_country(s1c, qc, k, chunk_rows, workers=1):
     merged = None
     for name, cfg in CHANNELS.items():
         t0 = time.time()
-        res = run_channel(cfg, s1c, qc, k, chunk_rows)
+        res = run_channel(cfg, s1c, qc, k, chunk_rows, workers)
         if res is None:
             print(f"      {name:5s}: skipped (no usable tokens after dropping common ones)")
             continue
@@ -175,6 +198,8 @@ def main():
     ap.add_argument("--k", type=int, default=10, help="candidates kept per channel")
     ap.add_argument("--chunk-rows", type=int, default=2000,
                     help="queries per matrix multiply; lower it if you run out of memory")
+    ap.add_argument("--workers", type=int, default=os.cpu_count() or 1,
+                    help="parallel processes (Linux only; Windows always uses 1)")
     args = ap.parse_args()
 
     d = Path(args.work_dir) / args.split
@@ -190,7 +215,7 @@ def main():
         print(f"\n[{country}] {len(s1c):,} S1 records, {len(qc):,} queries")
         if len(qc) == 0:
             continue
-        m = block_country(s1c, qc, args.k, args.chunk_rows)
+        m = block_country(s1c, qc, args.k, args.chunk_rows, args.workers)
         if m is None or m.empty:
             continue
         m["query_id"] = qc["entity_id"].to_numpy()[m["q"].to_numpy()]
