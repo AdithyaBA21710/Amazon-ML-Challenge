@@ -227,6 +227,8 @@ def main():
                     help="default: output/ for test, output_<split>/ otherwise")
     ap.add_argument("--threshold", type=float, default=None,
                     help="override the threshold in model_config.json")
+    ap.add_argument("--country-threshold", nargs="*", default=[], metavar="COUNTRY=VALUE",
+                    help="per-country thresholds, e.g. France=0.70 (default: same for all)")
     ap.add_argument("--k", type=int, default=10, help="must match the blocking used in training")
     ap.add_argument("--chunk-rows", type=int, default=2000)
     ap.add_argument("--batch", type=int, default=500_000, help="pairs per feature batch")
@@ -240,7 +242,13 @@ def main():
     model_path = str(work / "model_lgb.txt")
     cfg = json.loads((work / "model_config.json").read_text())
     thr = args.threshold if args.threshold is not None else cfg["threshold"]
+    country_thr = dict(cfg.get("country_thresholds", {}))
+    for item in args.country_threshold:
+        name, value = item.split("=")
+        country_thr[name] = float(value)
     print(f"Model: {len(cfg['features'])} features, threshold {thr:.2f}, workers {args.workers}")
+    if country_thr:
+        print(f"Per-country thresholds: {country_thr}")
 
     s1, queries = load_split(d, args.countries)
     print(f"{args.split}: {len(s1):,} Source 1 records, {len(queries):,} S2/S3 records")
@@ -254,7 +262,7 @@ def main():
         if cpath.exists() and bpath.exists() and not args.overwrite:
             print(f"\n[{country}] already scored, loading")
             cands.append(pd.read_parquet(cpath))
-            bests.append(pd.read_parquet(bpath))
+            bests.append(pd.read_parquet(bpath).assign(country=country))
             continue
         s1c, qc = country_frames(s1, queries, country)
         print(f"\n[{country}] {len(s1c):,} S1 records, {len(qc):,} S2/S3 records", flush=True)
@@ -264,13 +272,26 @@ def main():
         c_df.to_parquet(cpath, index=False)
         b_df.to_parquet(bpath, index=False)
         cands.append(c_df)
-        bests.append(b_df)
+        bests.append(b_df.assign(country=country))
         gc.collect()
 
     # apply the threshold and assemble the two files
     best = pd.concat(bests, ignore_index=True) if bests else pd.DataFrame(
-        {"query_id": [], "s1_id": [], "prob": []})
-    acc = best[best["prob"] >= thr].sort_values(["s1_id", "query_id"])
+        {"query_id": [], "s1_id": [], "prob": [], "country": []})
+    row_thr = best["country"].map(country_thr).fillna(thr).to_numpy(float)
+    prob = best["prob"].to_numpy()
+    keep = prob >= row_thr
+    sup_t, lone_t = cfg.get("support_threshold"), cfg.get("lone_threshold")
+    if sup_t is not None:   # weaker records accepted if their business has a confident match
+        supported = set(best.loc[keep, "s1_id"])
+        keep = keep | ((prob >= sup_t) & best["s1_id"].isin(supported).to_numpy())
+    acc = best[keep]
+    if lone_t is not None:  # a business's only match must be confident
+        cnt = acc.groupby("s1_id")["s1_id"].transform("size").to_numpy()
+        acc = acc[~((cnt == 1) & (acc["prob"].to_numpy() < lone_t))]
+    if sup_t is not None or lone_t is not None:
+        print(f"Entity-level rules: support {sup_t}, lone-match {lone_t}")
+    acc = acc.sort_values(["s1_id", "query_id"])
     matches = acc.groupby("s1_id", sort=False)["query_id"].agg(",".join)
     cand = (pd.concat(cands, ignore_index=True) if cands
             else pd.DataFrame({"s1_id": [], "candidates": []})).set_index("s1_id")["candidates"]
@@ -288,7 +309,7 @@ def main():
     n_matched = sum(1 for x in match_list if x)
     print("\n" + "=" * 70)
     print(f"Wrote {out / 'matching_results.tsv'}  and  {out / 'candidate_pairs.tsv'}")
-    print(f"Threshold {thr:.2f}: {len(all_ids):,} S1 entities, {n_matched:,} with matches, "
+    print(f"Threshold {thr:.3f} {country_thr or ''}: {len(all_ids):,} S1 entities, {n_matched:,} with matches, "
           f"{len(all_ids) - n_matched:,} left empty "
           f"({(len(all_ids) - n_matched) / max(len(all_ids), 1):.1%})")
     has = pd.Series([bool(x) for x in match_list], index=all_ids)

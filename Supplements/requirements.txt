@@ -1,9 +1,0 @@
-# Python 3.12+ (developed on Windows / Python 3.12, full runs on Ubuntu / Python 3.14)
-# System library needed by LightGBM on Linux:  sudo apt install -y libgomp1
-lightgbm==4.7.0
-numpy==2.5.3
-pandas==3.0.6
-pyarrow==25.0.1
-rapidfuzz==3.14.6
-scikit-learn==1.9.1
-scipy==1.18.1
